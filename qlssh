@@ -1,0 +1,231 @@
+
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+
+const SCRIPT_NAME = path.basename(__filename, ".js");
+const QL_BASE_LOG_DIR = "/ql/log";
+const SCRIPT_LOG_DIR = path.join(QL_BASE_LOG_DIR, SCRIPT_NAME);
+const TIMESTAMP = new Date().toISOString().replace(/[:T]/g, "_").split(".")[0];
+const LOG_FILE = path.join(SCRIPT_LOG_DIR, `${SCRIPT_NAME}_${TIMESTAMP}.log`);
+
+let logBuffer = "";
+
+function log(level, msg) {
+  const time = new Date().toTimeString().split(" ")[0];
+  const line = `[${time}] [${level}] ${msg}`;
+  logBuffer += line + "\n";
+  console.log(line);
+}
+
+function initLog(accountIndex, config) {
+  log("INFO", "==================================================================");
+  log("INFO", `🔄 青蛙续期SSH登录（账号${accountIndex}）`);
+  log("INFO", `🔍 目标信息：`);
+  log("INFO", `  主机: ${config.HOST}`);
+  log("INFO", `  端口: ${config.PORT}`);
+  log("INFO", `  用户: ${config.USER}`);
+  log("INFO", "==================================================================");
+}
+
+function networkCheck(host, port) {
+  log("INFO", "🔎 正在执行网络基础检查...");
+  try {
+    execSync(`ping -c 3 -W 2 ${host}`, { stdio: "ignore" });
+    log("INFO", "🟢 主机可达");
+  } catch {
+    log("ERROR", "🔴 主机不可达");
+    return false;
+  }
+
+  try {
+    execSync(`nc -z -w 3 ${host} ${port}`, { stdio: "ignore" });
+    log("INFO", `🟢 端口开放 (${port})`);
+  } catch {
+    log("ERROR", "🔴 端口未响应");
+    return false;
+  }
+
+  return true;
+}
+
+function checkGFWBlocked(host, callback) {
+  log("INFO", "🌐 正在检测 VPS 是否被墙...");
+  const testUrl = `https://ping.chinaz.com/${host}`;
+
+  https.get(testUrl, (res) => {
+    let data = "";
+    res.on("data", (chunk) => (data += chunk));
+    res.on("end", () => {
+      if (data.includes("超时") || data.includes("请求超时") || data.includes("不可达")) {
+        log("WARN", "🚧 VPS 可能已被墙（中国节点无法 Ping 通）");
+        callback(true);
+      } else {
+        log("INFO", "🟢 VPS 在中国节点可访问，未被墙");
+        callback(false);
+      }
+    });
+  }).on("error", (err) => {
+    log("ERROR", `❌ VPS检测失败：${err.message}`);
+    callback(null);
+  });
+}
+
+function testSSHLogin(config) {
+  log("INFO", "⏳ 正在尝试SSH登录...");
+
+  // 清理 known_hosts 中冲突记录
+  try {
+    execSync(`ssh-keygen -R ${config.HOST}`, { stdio: "ignore" });
+    log("INFO", `🧹 已清理 known_hosts 中 ${config.HOST} 的旧记录`);
+  } catch (e) {
+    log("WARN", `⚠️ 清理 known_hosts 失败：${e.message}`);
+  }
+
+  try {
+    const output = execSync(
+      `sshpass -p '${config.PASSWORD}' ssh -p ${config.PORT} ${config.USER}@${config.HOST} \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        "echo '远程命令执行成功'; date '+VPS 当前时间：%Y-%m-%d %H:%M:%S'"`,
+      { encoding: "utf-8" }
+    );
+
+    log("DEBUG", `命令输出: ${output}`);
+
+    if (output.includes("远程命令执行成功")) {
+      log("SUCCESS", "🎉 SSH登录成功");
+
+      const extract = output
+        .split("\n")
+        .filter((line) => line.includes("VPS 当前时间"))
+        .join("\n");
+
+      if (extract) {
+        log("INFO", "🕒 VPS 当前时间：");
+        log("INFO", extract);
+      }
+
+      return true;
+    } else {
+      log("ERROR", "❌ SSH登录失败");
+      return false;
+    }
+  } catch (e) {
+    log("ERROR", `❌ SSH登录失败: ${e.message}`);
+    return false;
+  }
+}
+
+function pushToNotify() {
+  log("INFO", "📤 正在使用青龙通知模块推送完整日志...");
+  const SCRIPT_DIR = __dirname;
+  const notifyScriptPath = path.join(SCRIPT_DIR, "sendNotify.js");
+
+  if (!fs.existsSync(notifyScriptPath)) {
+    log("ERROR", "❌ 未找到 sendNotify.js 脚本，推送失败");
+    return;
+  }
+
+  try {
+    const notify = require(notifyScriptPath);
+    const title = `🔐 多账号SSH登录诊断报告 ${new Date().toLocaleString()}`;
+    const content = logBuffer;
+
+    if (typeof notify.sendNotify === "function") {
+      notify.sendNotify(title, content);
+      log("INFO", "✅ 推送成功");
+    } else {
+      log("ERROR", "❌ sendNotify.js 中未找到 sendNotify 方法");
+    }
+  } catch (e) {
+    log("ERROR", `❌ 推送失败：${e.message}`);
+  }
+}
+
+function saveLogToFile() {
+  try {
+    fs.mkdirSync(SCRIPT_LOG_DIR, { recursive: true });
+    fs.writeFileSync(LOG_FILE, logBuffer);
+    log("INFO", `📁 日志已保存到 ${LOG_FILE}`);
+  } catch (e) {
+    log("ERROR", `❌ 日志保存失败：${e.message}`);
+  }
+}
+
+function loadAccounts() {
+  const accounts = [];
+  let index = 1;
+  while (true) {
+    const host = process.env[`SSH_HOST_${index}`];
+    const port = process.env[`SSH_PORT_${index}`];
+    const user = process.env[`SSH_USER_${index}`];
+    const password = process.env[`SSH_PASSWORD_${index}`];
+
+    if (!host || !port || !user || !password) break;
+
+    accounts.push({
+      index,
+      HOST: host,
+      PORT: port,
+      USER: user,
+      PASSWORD: password,
+    });
+
+    index++;
+  }
+
+  return accounts;
+}
+
+async function main() {
+  log("INFO", `## 脚本启动时间：${new Date().toLocaleString()}`);
+  const accounts = loadAccounts();
+
+  if (accounts.length === 0) {
+    log("ERROR", "❌ 未配置任何 SSH 账号");
+    return;
+  }
+
+  for (const config of accounts) {
+    log("INFO", `================= 开始账号 ${config.index} =================`);
+    initLog(config.index, config);
+
+    if (!networkCheck(config.HOST, config.PORT)) {
+      log("WARN", "❌ 网络检查失败，跳过该账号");
+      continue;
+    }
+
+    await new Promise((resolve) => {
+      checkGFWBlocked(config.HOST, (isBlocked) => {
+        if (isBlocked === true) {
+          log("WARN", "⚠️ VPS 可能被墙");
+        } else if (isBlocked === false) {
+          log("INFO", "✅ VPS 未被墙");
+        } else {
+          log("WARN", "⚠️ 无法判断 VPS 是否被墙");
+        }
+
+        const success = testSSHLogin(config);
+        if (!success) {
+          log("ERROR", "❌ 登录失败，结束该账号流程");
+        } else {
+          log("INFO", "✅ 登录流程完成");
+        }
+
+        resolve();
+      });
+    });
+
+    log("INFO", `================= 结束账号 ${config.index} =================\n`);
+  }
+
+  saveLogToFile();
+  pushToNotify();
+}
+
+main();
